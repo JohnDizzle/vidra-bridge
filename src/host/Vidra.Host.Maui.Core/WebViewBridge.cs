@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Vidra.Bridge;
 
 namespace Vidra.Hosting;
@@ -13,19 +15,26 @@ public sealed partial class WebViewBridge : IJsCallbackChannel, IUnsafeJsCallbac
     /// <summary>
     /// Name of the native message channel. JS posts to
     /// <c>window.webkit.messageHandlers.vidra</c> (WKWebView) or
-    /// <c>window.chrome.webview</c> (WebView2); see the platform partials.
+    /// <c>window.chrome.webview</c> (WebView2), or
+    /// <c>window.vidra</c> (Android WebView); see the platform partials.
     /// Kept in sync with <c>NATIVE_CHANNEL</c> in the JS SDK transport.
     /// </summary>
     private const string ChannelName = "vidra";
 
     private readonly BridgeDispatcher _dispatcher;
     private readonly VidraBridgeOptions _options;
+    private readonly ILogger<WebViewBridge> _logger;
+    private readonly ConcurrentDictionary<string, byte> _reportedDeniedEvents = new();
     private readonly PendingJsCallRegistry _pendingJsCalls = new();
     private WebView? _webView;
 
-    public WebViewBridge(BridgeDispatcher dispatcher, VidraBridgeOptions? options = null)
+    public WebViewBridge(
+        BridgeDispatcher dispatcher,
+        ILogger<WebViewBridge> logger,
+        VidraBridgeOptions? options = null)
     {
         _dispatcher = dispatcher;
+        _logger = logger;
         _options = options ?? new VidraBridgeOptions();
     }
 
@@ -74,6 +83,11 @@ public sealed partial class WebViewBridge : IJsCallbackChannel, IUnsafeJsCallbac
             return;
         }
 
+        // A frame arrived over the native channel, so the bundle's JavaScript has
+        // parsed, run, and constructed the SDK's transport. Nothing weaker than a
+        // booted bundle can produce one.
+        AnnounceBundleBoot();
+
         if (string.Equals(kind, "reverse", StringComparison.OrdinalIgnoreCase))
         {
             HandleReverseResponse(dataJson);
@@ -84,34 +98,164 @@ public sealed partial class WebViewBridge : IJsCallbackChannel, IUnsafeJsCallbac
         await PushToJsAsync($"window.__vidra_callback({response})");
     }
 
+    /// <summary>
+    /// Raised once per process when the loaded web bundle has proved it runs.
+    /// </summary>
+    /// <remarks>
+    /// This is what clears an updated bundle's probation, so it has to mean
+    /// something a broken bundle cannot fake. Two things say it, and whichever
+    /// happens first wins:
+    /// <list type="bullet">
+    /// <item>a frame arrived from JS — only the SDK's transport sends those, so
+    /// the bundle's JavaScript has parsed, run and reached native;</item>
+    /// <item>the page has installed <c>window.__vidra_initialize</c>, which the
+    /// SDK does while constructing its client. This covers a bundle that boots
+    /// the SDK and never calls into native.</item>
+    /// </list>
+    ///
+    /// The inbound frame is the one that normally fires, and it exists because
+    /// the poll alone was not enough: it takes its first sample a quarter of a
+    /// second after navigation completes, and an app whose page is already
+    /// talking to native by then can finish its work and exit inside that
+    /// window. When that happened the bundle stayed on probation, and two silent
+    /// launches later a perfectly good bundle was rolled back and blocked.
+    ///
+    /// What neither proves is that the app rendered anything. A bundle whose own
+    /// code throws after the SDK is up still counts as booted here, and would not
+    /// be rolled back. Closing that gap needs the JS side to say so explicitly,
+    /// which is a bridge contract change and deliberately not in the first
+    /// version.
+    /// </remarks>
+    public event Action? BundleBooted;
+
+    private int _bundleBootAnnounced;
+
+    /// <summary>
+    /// Raises <see cref="BundleBooted"/> exactly once, whichever proof arrives
+    /// first and on whichever thread carries it.
+    /// </summary>
+    private void AnnounceBundleBoot()
+    {
+        if (Interlocked.Exchange(ref _bundleBootAnnounced, 1) != 0)
+            return;
+
+        BundleBooted?.Invoke();
+    }
+
     private async void OnNavigated(object? sender, WebNavigatedEventArgs e)
     {
-        await PushToJsAsync("window.__vidra_native = true");
-
-        var handshake = new BridgeHandshake
+#if ANDROID
+        if (!_androidNativeChannelAvailable)
         {
-            ProtocolVersion = BridgeProtocol.Version,
-            CoreFingerprint = BridgeContractRegistry.Fingerprint(BridgeManifestScope.Core),
-            AppFingerprint = BridgeContractRegistry.Fingerprint(BridgeManifestScope.App),
-        };
+            try
+            {
+                await PushToJsAsync(
+                    "document.body.innerHTML='<main style=\"font-family:sans-serif;padding:2rem\"><h1>Android System WebView is outdated</h1><p>Update it to enable Vidra\\'s secure native bridge.</p></main>'");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to render the Android WebView compatibility diagnostic.");
+            }
+            return;
+        }
+#endif
+
+        // Both pushes are guarded, and the watcher starts either way. This is an
+        // `async void` event handler, so an escaping exception is an unhandled
+        // one; and on Windows the first push is a real thrower —
+        // EvaluateJavaScriptAsync reports "a valid CoreWebView2 is not present"
+        // when the handler is between platform views, which has been seen on CI.
+        // Letting that skip the watcher would leave a promoted bundle with
+        // nothing to clear its probation.
         try
         {
+            await PushToJsAsync("window.__vidra_native = true");
+
+            var handshake = new BridgeHandshake
+            {
+                ProtocolVersion = BridgeProtocol.Version,
+                CoreFingerprint = BridgeContractRegistry.Fingerprint(BridgeManifestScope.Core),
+                AppFingerprint = BridgeContractRegistry.Fingerprint(BridgeManifestScope.App),
+                AccessFingerprint = _dispatcher.AccessPolicy.Fingerprint,
+            };
+
+            // Protocol mismatch handling renders its diagnostic before throwing
+            // in JavaScript; keep the native UI thread alive so it remains visible.
             await PushToJsAsync($"window.__vidra_initialize({BridgeSerializer.Serialize(handshake)})");
         }
         catch (Exception ex)
         {
-            // Protocol mismatch handling renders its diagnostic before throwing
-            // in JavaScript; keep the native UI thread alive so it remains visible.
             System.Diagnostics.Debug.WriteLine(
                 $"[Vidra] Bridge protocol initialization failed: {ex.Message}");
+        }
+
+        if (BundleBooted is not null)
+            _ = WatchBundleBootAsync();
+    }
+
+    /// <summary>
+    /// Polls for the SDK's presence rather than assuming it is there when
+    /// navigation completes: the document is "navigated" before its scripts have
+    /// run, so a single check would report every bundle broken.
+    /// </summary>
+    /// <remarks>
+    /// The first sample is taken straight away and the wait moved to the end of
+    /// the loop. Sleeping first cost a quarter of a second on every launch, in
+    /// the one place where the app may already have everything it needs to exit.
+    /// </remarks>
+    private async Task WatchBundleBootAsync()
+    {
+        const int attempts = 40;
+
+        for (var attempt = 0; attempt < attempts && Volatile.Read(ref _bundleBootAnnounced) == 0; attempt++)
+        {
+            string? answer;
+            try
+            {
+                answer = await MainThread.InvokeOnMainThreadAsync(
+                    () => _webView?.EvaluateJavaScriptAsync(
+                        "String(typeof window.__vidra_initialize === 'function')")
+                        ?? Task.FromResult<string>(null!));
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[Vidra] boot probe failed: {ex.Message}");
+                await Task.Delay(TimeSpan.FromMilliseconds(250));
+                continue;
+            }
+
+            // Platforms disagree about whether a JS string comes back quoted.
+            if (answer?.Trim().Trim('"') == "true")
+            {
+                AnnounceBundleBoot();
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(250));
         }
     }
 
     private async void OnNavigating(object? sender, WebNavigatingEventArgs e)
     {
+#if ANDROID
+        // Android's supported transport is origin-scoped WebMessageListener.
+        // The scheme fallback cannot identify a subframe's origin, so accepting
+        // it would let embedded remote content invoke granted native methods.
+        // Consequently this path is never Android's bundle-boot proof; the
+        // message listener or SDK initialization probe owns that signal.
+        if (e.Url.StartsWith("vidra://", StringComparison.OrdinalIgnoreCase))
+        {
+            e.Cancel = true;
+            _logger.LogWarning(
+                "Rejected Android custom-scheme bridge traffic; update Android System WebView to use the secure native channel.");
+            return;
+        }
+#endif
+
         if (e.Url.StartsWith("vidra://reverse", StringComparison.OrdinalIgnoreCase))
         {
             e.Cancel = true;
+            AnnounceBundleBoot();
             var payload = Uri.UnescapeDataString(e.Url.Substring("vidra://reverse?payload=".Length));
             HandleReverseResponse(payload);
             return;
@@ -121,6 +265,10 @@ public sealed partial class WebViewBridge : IJsCallbackChannel, IUnsafeJsCallbac
             return;
 
         e.Cancel = true;
+
+        // Same claim as the native channel, on the transport platforms fall back
+        // to: only the SDK navigates to vidra://.
+        AnnounceBundleBoot();
 
         var bridgePayload = Uri.UnescapeDataString(e.Url.Substring("vidra://bridge?payload=".Length));
         var response = await _dispatcher.DispatchAsync(bridgePayload);
@@ -155,6 +303,18 @@ public sealed partial class WebViewBridge : IJsCallbackChannel, IUnsafeJsCallbac
         CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        if (!_dispatcher.AccessPolicy.AllowsEvent(contract, member))
+        {
+            if (_reportedDeniedEvents.TryAdd($"{contract}\0{member}", 0))
+            {
+                _logger.LogInformation(
+                    "Dropped ungranted bridge event {Contract}.{Member}.",
+                    contract,
+                    member);
+            }
+            return;
+        }
+
         var bridgeEvent = new BridgeEvent
         {
             Contract = contract,

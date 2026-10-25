@@ -1,0 +1,131 @@
+name: Bump version
+
+# The one place the Vidra version changes. Run it from the Actions tab, pick
+# patch/minor/major, and it opens a PR that moves version.json and every file
+# derived from it.
+#
+# Why a PR rather than a push to main: the bump touches the npm packages and the
+# .NET packages at once, and the PR gets the full CI suite before the number
+# becomes real. Merging it is what makes the release available; publishing is
+# still the separate, deliberate step in release-npm.yml / release-nuget.yml.
+#
+# Nothing here bumps an *app's* version — that is the app's own package.json,
+# bumped with `npm version patch` by whoever owns the app.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part to increment"
+        type: choice
+        options: [patch, minor, major, explicit]
+        default: patch
+      version:
+        description: "Exact version, when bump = explicit (e.g. 1.0.0-rc.1)"
+        type: string
+        required: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # A bump on top of an already-inconsistent tree would bury the drift in a
+      # release commit, so refuse before touching anything.
+      - name: The tree must already be consistent
+        run: node scripts/version.mjs check
+
+      - name: Work out the next version
+        id: next
+        run: |
+          current="$(node -p "require('./version.json').version")"
+          case "${{ inputs.bump }}" in
+            explicit)
+              next="${{ inputs.version }}"
+              if [ -z "$next" ]; then
+                echo "::error::bump=explicit requires a version"; exit 1
+              fi
+              ;;
+            *)
+              # Strip any prerelease before incrementing: bumping the patch of
+              # 1.2.3-rc.1 means 1.2.4, not 1.2.3-rc.2.
+              base="${current%%-*}"
+              IFS=. read -r major minor patch <<< "$base"
+              case "${{ inputs.bump }}" in
+                major) next="$((major + 1)).0.0" ;;
+                minor) next="$major.$((minor + 1)).0" ;;
+                patch) next="$major.$minor.$((patch + 1))" ;;
+              esac
+              ;;
+          esac
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "$current -> $next"
+
+      # "Released" means the registries, not this repository. The tag check came
+      # first and could never have fired: no release created a tag until
+      # tests/ci/tag-release.sh did, so 0.4.0 went out to npm and nuget.org with
+      # no v0.4.0 to find. The tag check stays — it is the cheap one, and it now
+      # has tags to catch — but the registries are asked as well, because they
+      # are what refuses the publish this bump is supposed to be preparing.
+      #
+      # Each registry is reached first and asked second. A check that passes
+      # because the network was down is the same useless check as the tag lookup
+      # that could never fire, so "could not ask" fails here rather than waving
+      # the bump through.
+      - name: Refuse to reuse a released version
+        run: |
+          next="${{ steps.next.outputs.next }}"
+          if git rev-parse "v$next" >/dev/null 2>&1; then
+            echo "::error::tag v$next already exists"; exit 1
+          fi
+
+          if ! npm view create-vidra-app version >/dev/null 2>&1; then
+            echo "::error::could not reach npm to check whether $next is taken"; exit 1
+          fi
+          for pkg in create-vidra-app vidra-cli @vidra-dev/sdk; do
+            if npm view "$pkg@$next" version >/dev/null 2>&1; then
+              echo "::error::$pkg@$next is already on npm"; exit 1
+            fi
+          done
+
+          if ! nuget="$(curl -sSf "https://api.nuget.org/v3-flatcontainer/vidra.bridge/index.json")"; then
+            echo "::error::could not reach nuget.org to check whether $next is taken"; exit 1
+          fi
+          if printf '%s' "$nuget" | jq -e --arg v "$next" '.versions | index($v)' >/dev/null; then
+            echo "::error::Vidra.Bridge $next is already on nuget.org"; exit 1
+          fi
+          echo "$next is unreleased on both registries"
+
+      - name: Apply the bump
+        run: |
+          node scripts/version.mjs set "${{ steps.next.outputs.next }}"
+          node scripts/version.mjs check
+          git diff --stat
+
+      - name: Open the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="release/v${{ steps.next.outputs.next }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "release: v${{ steps.next.outputs.next }}"
+          git push -u origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "release: v${{ steps.next.outputs.next }}" \
+            --body "$(printf '%s\n' \
+              "Bumps Vidra from \`${{ steps.next.outputs.current }}\` to \`${{ steps.next.outputs.next }}\` — the npm packages and every NuGet package move together, from \`version.json\`." \
+              "" \
+              "Generated by the \`Bump version\` workflow (\`${{ inputs.bump }}\`). Merging makes the version real; publishing is still a separate run of \`Release npm\` / \`Release NuGet\`.")"

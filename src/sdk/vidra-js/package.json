@@ -1,16 +1,30 @@
 {
   "name": "@vidra-dev/sdk",
-  "version": "0.2.0",
-  "description": "Framework-agnostic TypeScript SDK for Vidra bridge (JS ↔ .NET MAUI)",
+  "version": "0.5.0",
+  "description": "Framework-agnostic TypeScript SDK for Vidra bridge (JS \u2194 .NET MAUI)",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
+    },
+    "./config/tokens": {
+      "types": "./dist/config-tokens.d.ts",
+      "import": "./dist/config-tokens.js"
+    }
+  },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/emit-manifest.mjs",
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -45,14 +59,14 @@
   },
   "license": "MIT",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
-    "jsdom": "^25.0.1",
-    "typescript": "^5.7.0",
-    "vitest": "^2.1.4"
+    "jsdom": "^30.0.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }

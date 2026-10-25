@@ -5,32 +5,75 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets a branch be exercised without opening a PR — useful when the change
+  # being tested *is* the workflow.
+  workflow_dispatch:
+  # Callable as a gate by other workflows (see release-nuget.yml), so a release
+  # cannot publish from a commit that hasn't passed this suite.
+  workflow_call:
+
+# A push supersedes the run before it — no reason to keep paying for a commit
+# nobody is looking at any more.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Restore spends real time unpacking XML documentation nobody reads in CI,
+  # and the first-run/telemetry pings add latency to every dotnet invocation.
+  NUGET_XMLDOC_MODE: skip
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
 
 jobs:
   # Fast, deterministic tier: runs every unit, contract, and scaffold
   # integration test on a single Linux runner. All C# projects under
   # tests/dotnet/** target net10.0 (non-MAUI) so MAUI workloads are not
   # required here.
+  #
+  # Linux is a *build host*, not a Vidra target — there is no Linux app to
+  # package — so this tier covers framework correctness and the CLI's
+  # platform guard rails, and leaves artifacts to the per-OS smoke tier.
   unit-and-contract:
     name: Unit + contract (ubuntu-latest)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             10.0.x
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: |
-            src/cli/create-vidra-app/package-lock.json
+            src/cli/package-lock.json
             src/sdk/vidra-js/package-lock.json
+
+      # NuGet restore dominates the per-OS jobs — on Windows the dogfood host
+      # spent ~115s restoring and only ~20s compiling. The packages are keyed by
+      # the project files, so a hit makes every later restore in the job (the
+      # dogfood host, pack-local.sh, the scaffolded app) essentially free.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Build.props', 'pack-local.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # One version for everything Vidra publishes. Cheap, and it fails the
+      # commit rather than the release: npm and nuget.org both refuse to
+      # re-publish a version, so drift discovered at publish time is permanent.
+      - name: Versions are consistent
+        run: node scripts/version.mjs check
 
       # ---- C# unit + contract + codegen snapshots ----
       - name: Restore C# test projects
@@ -41,6 +84,8 @@ jobs:
           dotnet restore tests/dotnet/Vidra.Modules.FileSystem.Tests/Vidra.Modules.FileSystem.Tests.csproj
           dotnet restore tests/dotnet/Vidra.Modules.Windowing.Tests/Vidra.Modules.Windowing.Tests.csproj
           dotnet restore tests/dotnet/Vidra.Modules.Essentials.Tests/Vidra.Modules.Essentials.Tests.csproj
+          dotnet restore tests/dotnet/Vidra.Updates.Tests/Vidra.Updates.Tests.csproj
+          dotnet restore tests/dotnet/Vidra.Updates.Native.Tests/Vidra.Updates.Native.Tests.csproj
 
       - name: Build C# test projects
         run: |
@@ -50,6 +95,8 @@ jobs:
           dotnet build tests/dotnet/Vidra.Modules.FileSystem.Tests/Vidra.Modules.FileSystem.Tests.csproj -c Release --no-restore
           dotnet build tests/dotnet/Vidra.Modules.Windowing.Tests/Vidra.Modules.Windowing.Tests.csproj -c Release --no-restore
           dotnet build tests/dotnet/Vidra.Modules.Essentials.Tests/Vidra.Modules.Essentials.Tests.csproj -c Release --no-restore
+          dotnet build tests/dotnet/Vidra.Updates.Tests/Vidra.Updates.Tests.csproj -c Release --no-restore
+          dotnet build tests/dotnet/Vidra.Updates.Native.Tests/Vidra.Updates.Native.Tests.csproj -c Release --no-restore
 
       - name: Run Vidra.Bridge.Tests
         run: dotnet test tests/dotnet/Vidra.Bridge.Tests/Vidra.Bridge.Tests.csproj -c Release --no-build --logger "trx;LogFileName=bridge.trx"
@@ -61,6 +108,9 @@ jobs:
         run: |
           dotnet msbuild tests/dotnet/Vidra.CodeGen.AppFixture/Vidra.CodeGen.AppFixture.csproj -p:Configuration=Release -t:VidraCodeGenCheck
           dotnet msbuild tests/dotnet/Vidra.CodeGen.AppFixture/MissingAggregateTarget.proj -t:VidraCodeGen
+          # Multi-assembly, core-scope codegen — the shape the dogfood host uses,
+          # exercised here so it isn't only covered by the two platform jobs.
+          dotnet msbuild tests/dotnet/Vidra.CodeGen.AppFixture/AggregateScope.proj -t:VerifyAggregateCodeGen
 
       - name: Run Vidra.Modules.FileSystem.Tests
         run: dotnet test tests/dotnet/Vidra.Modules.FileSystem.Tests/Vidra.Modules.FileSystem.Tests.csproj -c Release --no-build --logger "trx;LogFileName=modules-filesystem.trx"
@@ -70,6 +120,21 @@ jobs:
 
       - name: Run Vidra.Modules.Essentials.Tests
         run: dotnet test tests/dotnet/Vidra.Modules.Essentials.Tests/Vidra.Modules.Essentials.Tests.csproj -c Release --no-build --logger "trx;LogFileName=modules-essentials.trx"
+
+      # The update client is deliberately MAUI-free so its decisions — which
+      # bundle is installable, what a failed boot does, whether an archive is
+      # safe to extract — are testable here rather than only through a packaged
+      # app on the per-OS legs.
+      - name: Run Vidra.Updates.Tests
+        run: dotnet test tests/dotnet/Vidra.Updates.Tests/Vidra.Updates.Tests.csproj -c Release --no-build --logger "trx;LogFileName=updates.trx"
+
+      # The Mac Catalyst locator and the native config resolution are plain
+      # .NET: a locator is a function of a process path and the files under it
+      #, so both are decided here in milliseconds. The conformance test in the
+      # same project needs a real Mac and skips itself; it runs on the macOS
+      # leg, where Velopack's own locator can be constructed to compare against.
+      - name: Run Vidra.Updates.Native.Tests
+        run: dotnet test tests/dotnet/Vidra.Updates.Native.Tests/Vidra.Updates.Native.Tests.csproj -c Release --no-build --logger "trx;LogFileName=updates-native.trx"
 
       # ---- TypeScript SDK ----
       - name: Install SDK dependencies
@@ -84,38 +149,102 @@ jobs:
         working-directory: src/sdk/vidra-js
         run: npm test
 
-      # ---- TypeScript CLI ----
+      # The scaffolded app's vidra.config.ts imports @vidra-dev/sdk/config, and
+      # the CLI loads that file for real in the --plan step below. The package
+      # only exports dist/, so an unbuilt SDK surfaces as "Package subpath
+      # './config' is not defined by exports" rather than as a missing file.
+      - name: Build SDK
+        working-directory: src/sdk/vidra-js
+        run: npm run build
+
+      # ---- TypeScript CLI (npm workspace: vidra-cli, create-vidra-app, shared) ----
       - name: Install CLI dependencies
-        working-directory: src/cli/create-vidra-app
+        working-directory: src/cli
         run: npm ci || npm install
 
-      - name: Run CLI tests (unit + scaffold integration)
-        working-directory: src/cli/create-vidra-app
-        run: npm test
+      # tsup bundles without type-checking and vitest transpiles per file, so
+      # neither notices a call with a missing argument or a variable renamed on
+      # one side only. Both reached main that way and failed only in the smoke
+      # legs, minutes later and far from the cause.
+      - name: Type-check CLI packages
+        working-directory: src/cli
+        run: npm run typecheck --workspaces
 
-      - name: Build CLI
-        working-directory: src/cli/create-vidra-app
-        run: npm run build
+      - name: Run CLI tests (unit + scaffold integration)
+        working-directory: src/cli
+        run: npm test --workspaces
+
+      - name: Build CLI packages
+        working-directory: src/cli
+        run: npm run build --workspaces --if-present
+
+      # ---- CLI behaviour on an unsupported platform ----
+      #
+      # Linux is detected by the CLI but has no build target. These assertions
+      # pin the guard rails so the failure stays a clear message instead of
+      # becoming a stack trace or, worse, a partial build.
+      - name: Assert the CLI rejects Linux as a build target
+        run: |
+          set +e
+          output=$(node src/cli/vidra-cli/dist/cli.js build --target linux 2>&1)
+          code=$?
+          set -e
+          echo "$output"
+          if [ $code -eq 0 ]; then
+            echo "::error::vidra build --target linux should exit non-zero"
+            exit 1
+          fi
+          echo "$output" | grep -qi "unsupported target" || {
+            echo "::error::expected an 'unsupported target' message"; exit 1; }
+
+      - name: Run vidra doctor
+        run: |
+          set +e
+          node src/cli/vidra-cli/dist/cli.js doctor
+          echo "doctor exit: $?"
+
+      # `--plan` returns before the MAUI workload gate, so the preview renders
+      # for both desktop targets on a Linux runner with no workloads installed.
+      - name: Assert vidra build --plan renders for both targets
+        run: |
+          cd "$RUNNER_TEMP"
+          node "$GITHUB_WORKSPACE/src/cli/create-vidra-app/dist/index.js" \
+            plan-smoke --app-id=com.vidra.plansmoke
+          cd plan-smoke
+          for target in macos windows android; do
+            output=$(node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" build --target "$target" --plan)
+            echo "$output"
+            echo "$output" | grep -q "nothing has run" || {
+              echo "::error::--plan for $target did not render the dry-run footer"; exit 1; }
+          done
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dotnet-trx
           path: "**/TestResults/*.trx"
           if-no-files-found: ignore
 
-  # Per-OS smoke tier: prove that (a) the real C# bridge wire format
-  # round-trips correctly through stdio on each target OS using the
-  # Vidra.Bridge.Smoke harness and the tests/smoke/echo-ping.mjs driver,
-  # and (b) the scaffolded template from create-vidra-app builds end-to-end
-  # against locally-packed NuGets for the platform-native TFM.
+  # Per-OS smoke tier. Proves, on each target OS, that:
+  #   (a) the real C# bridge wire format round-trips over stdio,
+  #   (b) the framework's own dogfood host still builds,
+  #   (c) the scaffolded template builds end-to-end against locally-packed NuGets,
+  #   (d) `vidra build` produces a correctly signed installer, and
+  #   (e) the app inside that installer actually launches and completes a
+  #       C# <-> JS bridge round-trip.
   #
-  # MAUI workloads are only installed for the template build step; the
-  # bridge echo-ping smoke itself targets net10.0 and needs no workload.
+  # (d) and (e) use a throwaway self-signed certificate. Apple's and Microsoft's
+  # trust chains matter for notarization and SmartScreen reputation, not for
+  # producing and verifying a signature — so the entire signing path is covered
+  # here without any paid certificate.
   smoke:
     name: Smoke (${{ matrix.os }})
-    needs: unit-and-contract
+    # Deliberately not `needs: unit-and-contract`. Gating the per-OS legs behind
+    # the Linux tier added its full duration to every run's wall clock without
+    # making failures visible any sooner — the Linux job reports independently
+    # either way. Runners are free for a public repo, so the only thing the gate
+    # bought was a slower green.
     strategy:
       fail-fast: false
       matrix:
@@ -124,50 +253,58 @@ jobs:
             tfm: net10.0-windows10.0.19041.0
             maui-workload: maui-windows
             target: windows
+            artifact-ext: zip
           - os: macos-latest
             tfm: net10.0-maccatalyst
             maui-workload: maui
             target: macos
+            artifact-ext: dmg
     runs-on: ${{ matrix.os }}
+    # Caps a hung step. The self-signed certificate steps are the risk: adding a
+    # cert to a trusted root store raises an interactive confirmation that a
+    # headless runner can never answer.
+    timeout-minutes: 100
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             10.0.x
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: |
-            src/cli/create-vidra-app/package-lock.json
+            src/cli/package-lock.json
             src/sdk/vidra-js/package-lock.json
 
-      # Pin xcode-select to the newest Xcode actually present on the
-      # runner image. As of this writing the macos-latest image tops out
-      # at Xcode 26.3, while the maui workload's MacCatalyst reference
-      # assemblies require the SDK shipped with Xcode 26.4 (MT0180). We
-      # therefore can't satisfy the workload's check at the SDK level;
-      # the host csproj disables the MacCatalyst linker for Debug builds
-      # via <MtouchLink>None</MtouchLink>, which skips the linker Setup
-      # step where MT0180 is raised. Selecting the newest available Xcode
-      # here is still worth doing so the rest of the toolchain (Info.plist
-      # validation, signing, etc.) targets the most recent SDK present.
-      - name: Select newest available Xcode (macOS)
-        if: runner.os == 'macOS'
-        uses: maxim-lobanov/setup-xcode@v1
+      # NuGet restore dominates the per-OS jobs — on Windows the dogfood host
+      # spent ~115s restoring and only ~20s compiling. The packages are keyed by
+      # the project files, so a hit makes every later restore in the job (the
+      # dogfood host, pack-local.sh, the scaffolded app) essentially free.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
         with:
-          xcode-version: "26.3"
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/Directory.Build.props', 'pack-local.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
 
+      # No xcode-select pin. There used to be one at 26.3, and it inverted: it
+      # held the runner on an older Xcode while the Catalyst pack required a
+      # newer SDK, so the linker failed the build the pin was meant to protect.
+      # The image default is the Xcode we link against. The workload set below
+      # is what has to stay within that Xcode's reach.
       - name: Log Xcode version (macOS)
         if: runner.os == 'macOS'
         run: |
           xcode-select -p
           xcodebuild -version
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
 
       # ---- Fast bridge echo-ping (no MAUI workload needed) ----
       - name: Build Vidra.Bridge.Smoke harness
@@ -184,22 +321,47 @@ jobs:
 
       # ---- Template build smoke (requires MAUI workload) ----
       #
-      # `--skip-manifest-update` is load-bearing on macOS today: without it,
-      # `dotnet workload install` pulls the newest maccatalyst manifest from
-      # NuGet, which currently requires the SDK shipped with Xcode 26.4. The
-      # macos-latest runner image only has up to Xcode 26.3 installed, so the
-      # next build would fail in ILLink's Setup step with MT0180. Sticking to
-      # the manifest version bundled with the installed .NET SDK pins us to a
-      # workload that's coherent with what's actually on the runner. This is
-      # safe on Windows too (the maui-windows manifest doesn't track Xcode),
-      # so we apply it uniformly.
+      # macOS pins the workload set. An unpinned install now resolves to
+      # Mac Catalyst 27.0.10722, and ILLink dies with MT0180 because that pack
+      # requires the Xcode 27 SDK while macos-latest still has Xcode 26.
+      # 10.0.303.1 is the newest set still on the 26.5 SDK, which Xcode 26.6
+      # can link. Do not replace this with `--skip-manifest-update`: that froze
+      # the pack at 26.0.11017, before the app-bundle name fix
+      # (dotnet/macios#26318, 26.2.10233+), and `dotnet watch` could not launch
+      # the app — the thing this job exists to prove. Windows does not link
+      # against the Catalyst SDK, so it keeps the latest set.
       - name: Install MAUI workload (${{ matrix.maui-workload }})
         shell: bash
-        run: dotnet workload install ${{ matrix.maui-workload }} --skip-manifest-update
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            dotnet workload install ${{ matrix.maui-workload }} --version 10.0.303.1
+          else
+            dotnet workload install ${{ matrix.maui-workload }}
+          fi
 
       - name: Log installed workloads
         shell: bash
         run: dotnet workload list
+
+      # ---- Locator conformance (macOS only) ----
+      #
+      # Vidra ships its own IVelopackLocator because Velopack's client does not
+      # enumerate Mac Catalyst. The objection to owning one is that it encodes
+      # an install layout Velopack can change without calling it breaking, so
+      # this asserts ours answers exactly what `OsxVelopackLocator` answers over
+      # the same fixture bundle. It has to run here rather than on Linux for the
+      # same reason the locator exists: theirs refuses to construct off macOS.
+      #
+      # After the workload install, not before it: the test project references
+      # the `net10.0` half of a package that also targets `net10.0-maccatalyst`,
+      # and restoring it needs the Catalyst workload even though nothing here
+      # builds that half.
+      - name: Locator conformance against Velopack's own (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dotnet test tests/dotnet/Vidra.Updates.Native.Tests/Vidra.Updates.Native.Tests.csproj \
+            -c Release --logger "trx;LogFileName=updates-native-macos.trx"
 
       - name: Build SDK
         shell: bash
@@ -208,12 +370,43 @@ jobs:
           npm ci || npm install
           npm run build
 
-      - name: Build and link CLI
+      - name: Build CLI packages
         shell: bash
-        working-directory: src/cli/create-vidra-app
+        working-directory: src/cli
         run: |
           npm ci || npm install
-          npm run build
+          npm run build --workspaces --if-present
+
+      - name: Run vidra doctor
+        shell: bash
+        run: |
+          set +e
+          node src/cli/vidra-cli/dist/cli.js doctor
+          echo "doctor exit: $?"
+
+      # The framework's own dogfood host is the only consumer of the aggregate
+      # `--scope core` codegen target, so nothing else in CI would notice if it
+      # stopped compiling.
+      - name: Build the dogfood host (${{ matrix.tfm }})
+        shell: bash
+        run: |
+          # No preparatory build of Vidra.CodeGen: the host's post-build codegen
+          # runs the tool with `--no-build`, and ordering that is the host's own
+          # job (it carries a build-order ProjectReference to the tool). Wiping
+          # the tool's Debug output first keeps this a clean-checkout test even
+          # if some earlier step in this job starts building it.
+          rm -rf src/tools/Vidra.CodeGen/bin/Debug
+          dotnet build src/host/Vidra.Host.Maui/Vidra.Host.Maui.csproj \
+            -c Debug -f ${{ matrix.tfm }}
+
+      # This build is what regenerates the SDK's committed built-in contracts,
+      # so it is also the only place drift in them can be caught. macOS only:
+      # the runner checks out with autocrlf, the generator writes LF, and every
+      # regenerated file would read as modified on Windows.
+      - name: Built-in contracts are unchanged by the dogfood build
+        if: runner.os == 'macOS'
+        shell: bash
+        run: git diff --exit-code -- src/sdk/vidra-js/src/generated
 
       - name: Pack local NuGet feed
         shell: bash
@@ -250,21 +443,133 @@ jobs:
           npm ci || npm install
           npm run build --if-present
 
-      # ---- Packaging smoke: run the real `vidra build` end-to-end ----
+      # ---- Signing identity (throwaway, self-signed) ----
+      - name: Create a self-signed signing identity (macOS)
+        timeout-minutes: 5
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash tests/ci/macos-selfsigned-identity.sh
+
+      - name: Create a self-signed signing certificate (Windows)
+        timeout-minutes: 5
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/ci/windows-selfsigned-cert.ps1
+
+      # ---- Dev-loop smoke: `vidra dev` and the C# dev loop ----
       #
-      # The steps above only prove the scaffolded host *builds* (Debug,
-      # unpackaged). This runs the full `vidra build` pipeline — UI build,
-      # asset copy, `dotnet publish -c Release`, codesign (macOS), and
-      # DMG/MSIX packaging — and asserts an installer actually lands in
-      # dist/. It is the only coverage for the distribution path. We invoke
-      # the built CLI directly (the `vidra` bin → dist/cli.js) so the check
-      # doesn't depend on the scaffolded app's node_modules/.bin.
+      # Runs before the E2E MainPage is installed, so it exercises the normal
+      # template page (the E2E variant exits the process on success, which would
+      # end the dev session immediately).
+      #
+      # macOS only for now: the script tears the session down via POSIX process
+      # groups, which git-bash on the Windows runner does not provide. Windows
+      # dev-loop coverage needs a PowerShell counterpart.
+      #
+      # Every check in the script is a hard assertion, including the two that
+      # used to be warnings — the app reaching readiness, and coming back up
+      # after a C# edit. Both were blocked by `dotnet watch run` never launching
+      # a Mac Catalyst app; `vidra dev` no longer asks it to. Two full builds and
+      # launches fit inside the timeout with room to spare.
+      - name: Smoke the dev loop (vidra dev + a C# edit reaching the app)
+        if: runner.os == 'macOS'
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          bash tests/ci/dev-loop-smoke.sh \
+            "${{ runner.temp }}/vidra-smoke" \
+            "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            ${{ matrix.target }}
+
+      # ---- Runtime E2E harness ----
+      #
+      # Swap the scaffolded app's MainPage for one that calls into JavaScript
+      # over the typed contract and writes the result to $VIDRA_E2E_PROOF. The
+      # launch steps below assert that proof, which is only produced if the
+      # packaged app loaded its bundled assets, passed the protocol-v2
+      # fingerprint handshake, and completed a full C# -> JS -> C# round-trip.
+      - name: Install the E2E proof MainPage into the scaffolded app
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          sed 's/__PROJECT_NAMESPACE__/VidraSmoke/' \
+            "$GITHUB_WORKSPACE/tests/smoke/e2e-main-page.cs.in" \
+            > src/VidraSmoke.Host/MainPage.cs
+          echo "---- MainPage.cs ----"
+          head -25 src/VidraSmoke.Host/MainPage.cs
+
+      # Proves the whole version chain end to end, and proves it is the app's
+      # package.json driving it: 1.2.3 exists nowhere else, so a bundle carrying
+      # it cannot have come from the template's csproj default.
+      - name: Set a distinctive app version
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          node -e "const f='package.json',p=require('./'+f);p.version='1.2.3';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+          node -p "require('./package.json').version"
+
+      - name: Preview the build plan (vidra build --plan)
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            build --target ${{ matrix.target }} --plan
+
+      # ---- Packaging smoke: run the real `vidra build` end-to-end ----
       - name: Package the scaffolded app (vidra build --target ${{ matrix.target }})
         shell: bash
         working-directory: ${{ runner.temp }}/vidra-smoke
         run: |
-          node "$GITHUB_WORKSPACE/src/cli/create-vidra-app/dist/cli.js" \
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
             build --target ${{ matrix.target }} --verbose
+
+      # ApplicationDisplayVersion -> CFBundleShortVersionString, and the derived
+      # build number -> CFBundleVersion (0.1.0 would have been 100; 1.2.3 is
+      # 1*10000 + 2*100 + 3).
+      - name: The app version reached the bundle (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          plist="$(find src/VidraSmoke.Host/bin/Release/net10.0-maccatalyst -name Info.plist -path '*.app/Contents/*' -print -quit)"
+          echo "plist: $plist"
+          short="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+          build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")"
+          echo "CFBundleShortVersionString=$short CFBundleVersion=$build"
+          [ "$short" = "1.2.3" ] || { echo "::error::expected 1.2.3 from package.json, got $short"; exit 1; }
+          [ "$build" = "10203" ] || { echo "::error::expected build 10203, got $build"; exit 1; }
+
+      # The bundle that ships is the one at the TFM root: `stepDotnetPublish`
+      # returns `bin/Release/<tfm>` and `macosTarget.findBundle` reads exactly
+      # that directory, non-recursively, so that is what gets signed, DMG'd and
+      # packed. The Catalyst SDK lipos the per-RID builds into it, which is why
+      # it is universal — and it has to stay that way, because a single RID
+      # pinned anywhere upstream of here would silently ship half an app to
+      # everyone on the other architecture.
+      - name: The packaged app is universal (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          root=src/VidraSmoke.Host/bin/Release/net10.0-maccatalyst
+          app="$(find "$root" -maxdepth 1 -name '*.app' -type d -print -quit)"
+          [ -n "$app" ] || { echo "::error::no .app at $root, which is where the CLI looks"; exit 1; }
+          bin="$app/Contents/MacOS/$(ls "$app/Contents/MacOS" | head -1)"
+          archs="$(lipo -archs "$bin")"
+          echo "$app -> $archs"
+          for want in x86_64 arm64; do
+            case " $archs " in
+              *" $want "*) ;;
+              *) echo "::error::$bin is missing the $want slice (got: $archs)"; exit 1 ;;
+            esac
+          done
+
+      - name: The app version reached the artifact name
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          ls -1 dist/
+          ls dist/ | grep -q "1\.2\.3" || { echo "::error::no artifact carries the app version"; exit 1; }
 
       - name: Verify a distributable artifact was produced
         shell: bash
@@ -273,17 +578,480 @@ jobs:
           echo "Contents of dist/:"
           ls -la dist/ 2>/dev/null || { echo "::error::vidra build did not create a dist/ directory"; exit 1; }
           shopt -s nullglob
-          artifacts=(dist/*.dmg dist/*.zip dist/*.msix dist/*.msixbundle)
-          if [ ${#artifacts[@]} -eq 0 ]; then
-            echo "::error::vidra build produced no installer (.dmg/.zip) for target ${{ matrix.target }}"
+          # Assert the artifact this target is supposed to produce, so a target
+          # silently emitting the wrong kind of installer fails here.
+          artifacts=(dist/*.${{ matrix.artifact-ext }})
+          if [ ${#artifacts[@]} -ne 1 ]; then
+            echo "::error::expected exactly one .${{ matrix.artifact-ext }} for target ${{ matrix.target }}, found ${#artifacts[@]}"
             exit 1
           fi
-          echo "Produced artifact(s): ${artifacts[*]}"
+          artifact="$PWD/${artifacts[0]}"
+          # The Windows leg runs these steps under git-bash but consumes
+          # $ARTIFACT from PowerShell, which cannot resolve an MSYS path.
+          if command -v cygpath >/dev/null 2>&1; then
+            artifact="$(cygpath -w "$artifact")"
+          fi
+          echo "ARTIFACT=$artifact"
+          echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
 
-      - name: Upload packaged installer
+      - name: Verify the macOS signature, hardened runtime and entitlements
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash tests/ci/verify-macos-artifact.sh "$ARTIFACT" \
+            "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js"
+
+      - name: Launch the packaged app and prove the bridge works (macOS)
+        timeout-minutes: 10
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash tests/ci/launch-macos-app.sh "$ARTIFACT"
+
+      - name: Verify the signature, launch, and prove the bridge works (Windows)
+        timeout-minutes: 10
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./tests/ci/launch-windows-app.ps1 -Zip "$env:ARTIFACT" `
+            -Cli "$env:GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js"
+
+      # Uploaded here, while dist/ still holds exactly one file, rather than at
+      # the end of the job. Everything below builds the same scaffold again into
+      # the same dist/ and nothing ever cleans it (the OTA rebuild, then 1.0.0
+      # and 1.0.1 with Velopack's accumulating feed), so uploading at the end
+      # shipped every copy at once: 804 MB on Windows and 216 MB on macOS to
+      # carry one 88 MB / 33 MB installer. Worse, the OTA rebuild below
+      # overwrites this very filename, so that artifact carried bytes no step
+      # had signature-checked or launched. From here it carries the file the
+      # verify-and-launch steps above just ran, and nothing between them and
+      # this step writes into dist/: the launch scripts stage into their own
+      # temp directories. The update-enabled rebuild is deliberately not
+      # uploaded, since the OTA round-trip runs the binary from bin/Release and
+      # never anything in dist/, so that file was never the thing under test.
+      #
+      # Still uploaded on failure, since a broken installer is worth inspecting.
+      # Staying lenient here is deliberate: the strict gate is the
+      # "Verify a distributable artifact was produced" step above, which asserts
+      # exactly one artifact of the expected type. Making the upload strict too
+      # would bury an earlier real failure under a second, confusing one.
+      #
+      # Named globs rather than `dist/*`: a feed directory lives under `dist/`
+      # now, and it holds a 94 MB package the native-update proofs already
+      # upload the interesting parts of.
+      #
+      # "artifact" rather than "installer", because on Windows this is a
+      # self-contained ZIP. An installer only exists once an app configures a
+      # native feed, and this build has none — the real `Setup.exe` is produced
+      # by the native round-trip further down, and uploaded there.
+      - name: Upload packaged artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: vidra-installer-${{ matrix.os }}
-          path: ${{ runner.temp }}/vidra-smoke/dist/*
+          name: vidra-artifact-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/vidra-smoke/dist/*.dmg
+            ${{ runner.temp }}/vidra-smoke/dist/*.zip
           if-no-files-found: ignore
+
+      # ---- Over-the-air bundle updates ----
+      #
+      # A second build of the same scaffold, configured for updates and driven
+      # through a sequence of launches against a real HTTP feed. Sequence is the
+      # point: "applies on the next launch", "never applies", and "is undone
+      # after failing twice" are all statements about consecutive runs, and none
+      # of them can be observed from a single one.
+      - name: Configure the scaffolded app for updates
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          # The whole opt-in a real app makes: a feed URL in vidra.config.ts. The
+          # builder call, the package reference and the entry points all ship in
+          # the template, which the assertion below is here to keep honest.
+          #
+          # A real signing key, made by the command a publisher would run. The
+          # public half goes into vidra.config.ts, which makes signatures mandatory
+          # for this app — so the whole run also proves the signed path works.
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            keygen --out ota-signing-key.pem
+          node -e "
+            const fs = require('fs');
+            const source = fs.readFileSync('src/VidraSmoke.Host/MauiProgram.cs', 'utf8')
+              .replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+            if (!source.includes('.UseVidraUpdates()')) {
+              console.error('the scaffolded app does not call .UseVidraUpdates()');
+              process.exit(1);
+            }
+            const publicKey = fs.readFileSync('ota-signing-key.pem.pub', 'utf8').trim();
+            // feed.web rather than a bare feed string: this app is testing web
+            // bundles, and one string turns on *both* tiers, which would demand
+            // vpk from a job that has not installed it yet.
+            const config = fs.readFileSync('vidra.config.ts', 'utf8');
+            const updates = 'updates: { feed: { web: \"http://127.0.0.1:8099/\" }, publicKeys: [' + JSON.stringify(publicKey) + '] }';
+            fs.writeFileSync('vidra.config.ts', config.replace(/updates:\s*\{\s*feed:\s*\"\"\s*,?\s*\}/, updates));
+          "
+          sed 's/__PROJECT_NAMESPACE__/VidraSmoke/' \
+            "$GITHUB_WORKSPACE/tests/smoke/ota-main-page.cs.in" \
+            > src/VidraSmoke.Host/MainPage.cs
+
+      # `--app`, not a full build: this step wants the binary with the feed URL
+      # stamped into it, and the e2e below publishes the bundle itself once its
+      # server is up. A full build would try to merge from a feed nothing is
+      # serving yet, and merging fails closed on purpose — a failed fetch must
+      # never publish an index that drops every existing entry.
+      - name: Rebuild the app with updates enabled
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            build --app --target ${{ matrix.target }}
+
+      - name: Locate the update-enabled app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          root=src/VidraSmoke.Host/bin/Release/net10.0-maccatalyst
+          app="$(find "$root" -maxdepth 1 -name '*.app' -type d -print -quit)"
+          [ -n "$app" ] || { echo "::error::no .app under $root"; exit 1; }
+          echo "OTA_BIN=$PWD/$app/Contents/MacOS/$(ls "$app/Contents/MacOS" | head -1)" >> "$GITHUB_ENV"
+
+      - name: Locate the update-enabled app (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          exe="src/VidraSmoke.Host/bin/Release/net10.0-windows10.0.19041.0/win-x64/publish/VidraSmoke.Host.exe"
+          [ -f "$exe" ] || { echo "::error::no VidraSmoke.Host.exe at $exe"; exit 1; }
+          echo "OTA_BIN=$(cygpath -w "$PWD/$exe")" >> "$GITHUB_ENV"
+
+      - name: Prove an update applies, is refused, or is rolled back
+        timeout-minutes: 20
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+          node "$(native "$GITHUB_WORKSPACE/tests/smoke/ota-e2e.mjs")" \
+            --bin "$OTA_BIN" \
+            --project "$(native "$PWD")" \
+            --cli "$(native "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js")" \
+            --signing-key "$(native "$PWD/ota-signing-key.pem")" \
+            --work "$(native "${{ runner.temp }}/ota-work")"
+
+      - name: Upload OTA proofs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ota-proofs-${{ matrix.os }}
+          path: ${{ runner.temp }}/ota-work/*.json
+          if-no-files-found: ignore
+
+      # ---- Native (whole-app) updates ----
+      #
+      # The same scaffold again: two releases built by `vidra build`, the first
+      # one installed, and the second applied to it in place. Folded in from a
+      # throwaway probe rig, which proved the sequence against raw Velopack.
+      # What is under test here is Vidra's own glue: the entry points, the
+      # builder call, the config resolution, and (on macOS) the Catalyst locator
+      # Velopack does not ship.
+      #
+      # The scaffold above already built and launched this same app with the
+      # updater live and *nothing* configured — which is the other half of the
+      # claim a feed URL is the only switch, and the only place `VelopackApp.Run()`
+      # is exercised in an app that was never packed.
+      - name: Install vpk
+        shell: bash
+        run: |
+          # Pinned to match the Velopack PackageReference. Every behaviour the
+          # CLI encodes -- the "already in the feed" refusal, the version
+          # banner it scrapes, --keychain wanting a path -- was measured
+          # against 1.2.0, so a vpk bump should be a deliberate PR rather
+          # than something a restore does to a green run.
+          dotnet tool install -g vpk --version 1.2.0 \
+            || dotnet tool update -g vpk --version 1.2.0
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "$USERPROFILE\\.dotnet\\tools" >> "$GITHUB_PATH"
+          else
+            echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          fi
+
+      # One step, because there is one switch. Nothing about the app's own source
+      # changes here, which is also why the `rm -rf bin obj` this step used to
+      # need is gone: the dependency graph is the same before and after, so Mac
+      # Catalyst cannot reuse an AOT image compiled against a different one.
+      - name: Configure the scaffolded app for native updates (1.0.0)
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          node "$GITHUB_WORKSPACE/tests/ci/native-update-setup.mjs" \
+            --project "$PWD" --name VidraSmoke --version 1.0.0 \
+            --main-page "$GITHUB_WORKSPACE/tests/smoke/native-update-main-page.cs.in"
+
+      # The feed is not serving during the build, so `vpk download` finds
+      # nothing and warns, which is exactly the first-release case.
+      - name: Build and pack 1.0.0
+        timeout-minutes: 25
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            build --target ${{ matrix.target }}
+          ls -la dist dist/feed
+
+      # `vpk pack` overwrites the un-versioned artifacts in its output directory
+      # on every release, so anything from 1.0.0 has to be taken before 1.0.1 is
+      # packed. `vidra build` already writes a versioned Setup.exe for exactly
+      # this reason; the portable archive still has to be captured by hand.
+      - name: Capture the 1.0.0 install
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          rm -rf "${{ runner.temp }}/native-install"
+          mkdir -p "${{ runner.temp }}/native-install"
+          zip="$(ls dist/feed/*Portable.zip | head -1)"
+          echo "portable: $zip"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            ditto -x -k "$zip" "${{ runner.temp }}/native-install"
+            app="$(find "${{ runner.temp }}/native-install" -maxdepth 2 -name '*.app' -type d -print -quit)"
+            [ -n "$app" ] || { echo "::error::no .app inside the portable archive"; exit 1; }
+            echo "NATIVE_EXE=$app" >> "$GITHUB_ENV"
+            echo "==> installed 1.0.0 at $app"
+          else
+            cp dist/VidraSmoke-1.0.0-Setup.exe "${{ runner.temp }}/Setup-1.0.0.exe"
+          fi
+
+      - name: Build and pack 1.0.1
+        timeout-minutes: 25
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          node "$GITHUB_WORKSPACE/tests/ci/native-update-setup.mjs" \
+            --project "$PWD" --name VidraSmoke --version 1.0.1
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            build --target ${{ matrix.target }}
+          ls -la dist/feed
+          cat dist/feed/releases*.json
+
+      # Rebuilding at an unchanged version is the ordinary inner loop now that a
+      # config field, not a flag, decides whether a build packs — so it has to
+      # succeed, leave the feed exactly as it was, and still produce an artifact
+      # built from this publish rather than the previous pack's archive.
+      #
+      # `vpk pack` refuses a version already in the feed rather than overwriting
+      # it or emitting a second package under one version (measured on Linux with
+      # vpk 1.2.0); this asserts we turn that refusal into a skip.
+      - name: Rebuilding a published version skips the pack and leaves the feed alone
+        timeout-minutes: 25
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          before="$(ls dist/feed | sort | tr '\n' ' ')"
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            build --target ${{ matrix.target }} 2>&1 | tee rebuild.log
+          grep -qi "already in the feed" rebuild.log || {
+            echo "::error::expected the 'already in the feed' skip"; exit 1; }
+          after="$(ls dist/feed | sort | tr '\n' ' ')"
+          [ "$before" = "$after" ] || {
+            echo "::error::the release directory changed on a rebuild of a published version"
+            ls -la dist/feed; exit 1; }
+
+      - name: Install 1.0.0 with the generated Setup.exe (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $setup = "${{ runner.temp }}/Setup-1.0.0.exe"
+          Write-Host "running $setup --silent"
+          $p = Start-Process -FilePath $setup -ArgumentList "--silent" -PassThru -Wait
+          Write-Host "setup exit code: $($p.ExitCode)"
+          $root = Join-Path $env:LOCALAPPDATA "com.vidra.smoke"
+          if (-not (Test-Path $root)) {
+            Write-Host "::error::no install root at $root"
+            exit 1
+          }
+          Get-ChildItem -Recurse -Depth 2 $root | Select-Object -First 40 | Format-Table FullName
+          $exe = Get-ChildItem -Recurse $root -Filter "VidraSmoke.Host.exe" | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::no VidraSmoke.Host.exe under $root"; exit 1 }
+          "NATIVE_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Apply a 1.0.0 -> 1.0.1 native update
+        timeout-minutes: 25
+        shell: bash
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        run: |
+          native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
+          node "$(native "$GITHUB_WORKSPACE/tests/smoke/native-update-e2e.mjs")" \
+            --exe "$(native "$NATIVE_EXE")" \
+            --feed "$(native "$PWD/dist/feed")" \
+            --work "$(native "${{ runner.temp }}/native-work")"
+
+      - name: The updated app is still signed (macOS)
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          # The step is `always()`, so an earlier failure leaves NATIVE_EXE
+          # unset and there is nothing to check. The job is already red then.
+          [ -n "${NATIVE_EXE:-}" ] || exit 0
+          # The signature is asserted, because an updater-replaced bundle
+          # keeping a valid one is the claim. Whether Gatekeeper accepts it
+          # is not, and cannot be: that needs a notarized build, which no CI
+          # here can produce.
+          codesign -dv --verbose=4 "$NATIVE_EXE" 2>&1 | sed -n '1,12p' || true
+          codesign --verify --strict "$NATIVE_EXE"
+
+      # The one artifact nobody could inspect until now, and the one most worth
+      # having when a release goes wrong: the installer the round-trip above
+      # actually installed from. `Setup.exe` on Windows is written by `vpk` and
+      # copied to a versioned name by the build; on macOS the equivalent is the
+      # DMG wrapping the packed `.app`. Both are the *packed* artifact, which is
+      # the thing that differs from the plain build uploaded earlier.
+      - name: Upload the installer the round-trip used
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vidra-packed-installer-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/vidra-smoke/dist/*Setup.exe
+            ${{ runner.temp }}/vidra-smoke/dist/*.dmg
+          if-no-files-found: ignore
+
+      - name: Upload native-update proofs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-update-proofs-${{ matrix.os }}
+          # The whole feed index, not just releases.<channel>.json: RELEASES* is
+          # Velopack's legacy client index and assets.<channel>.json its upload
+          # manifest, and "the feed is malformed for an older client" is a
+          # different failure from "the JSON is wrong". The whole index is about
+          # 1.2 KB. The delta comes along because Windows is the leg
+          # that applies it (`feed 200 com.vidra.smoke-1.0.1-delta.nupkg`, 255
+          # KB against a 94 MB full package), and it is the one feed file the
+          # `ls -la dist/feed` above cannot show you the inside of. Catalyst
+          # applies the full package instead, so on macOS the delta is evidence
+          # about what the feed published rather than about the bytes that were
+          # applied. The full packages stay out at 32-94 MB each; their sizes
+          # and SHA256s are already in releases.<channel>.json.
+          path: |
+            ${{ runner.temp }}/native-work/*
+            ${{ runner.temp }}/vidra-smoke/dist/feed/*.json
+            ${{ runner.temp }}/vidra-smoke/dist/feed/RELEASES*
+            ${{ runner.temp }}/vidra-smoke/dist/feed/*delta.nupkg
+          if-no-files-found: ignore
+
+  android-emulator:
+    name: Android emulator smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            src/cli/package-lock.json
+            src/sdk/vidra-js/package-lock.json
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Android workload
+        run: dotnet workload install maui-android
+
+      - name: Build SDK, CLI, and local packages
+        run: |
+          npm ci --prefix src/sdk/vidra-js || npm install --prefix src/sdk/vidra-js
+          npm run build --prefix src/sdk/vidra-js
+          npm ci --prefix src/cli || npm install --prefix src/cli
+          npm run build --prefix src/cli --workspaces --if-present
+          ./pack-local.sh
+
+      - name: Scaffold Android smoke app
+        working-directory: ${{ runner.temp }}
+        run: |
+          node "$GITHUB_WORKSPACE/src/cli/create-vidra-app/dist/index.js" \
+            vidra-smoke --app-id=com.vidra.smoke
+          sed 's/__PROJECT_NAMESPACE__/VidraSmoke/' \
+            "$GITHUB_WORKSPACE/tests/smoke/ota-main-page.cs.in" \
+            > vidra-smoke/src/VidraSmoke.Host/MainPage.cs
+          (
+          cd vidra-smoke
+          node -e "
+            const fs = require('fs');
+            const config = fs.readFileSync('vidra.config.ts', 'utf8');
+            fs.writeFileSync(
+              'vidra.config.ts',
+              config.replace(
+                /updates:\\s*\\{\\s*feed:\\s*\"\"\\s*,?\\s*\\}/,
+                'updates: { feed: { web: \"http://127.0.0.1:8099/\" } }',
+              ),
+            );
+          "
+          )
+          npm ci --prefix vidra-smoke
+          npm ci --prefix vidra-smoke/ui
+
+      - name: Create Android release keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore "${{ runner.temp }}/vidra-release.jks" \
+            -storepass android -keypass android -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Vidra CI,O=Vidra,C=US"
+
+      - name: Build signed APK and AAB
+        working-directory: ${{ runner.temp }}/vidra-smoke
+        env:
+          VIDRA_ANDROID_KEYSTORE: ${{ runner.temp }}/vidra-release.jks
+          VIDRA_ANDROID_KEY_ALIAS: release
+          VIDRA_ANDROID_KEY_PASSWORD: android
+          VIDRA_ANDROID_STORE_PASSWORD: android
+          # Intent-extra controls stay gated by the manifest debuggable flag;
+          # this release-shaped smoke opts in explicitly.
+          VIDRA_ANDROID_DEBUGGABLE: "1"
+        run: |
+          node "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" \
+            build --target android --app
+          test -n "$(ls dist/*-android.apk)"
+          test -n "$(ls dist/*-android.aab)"
+
+      - name: Launch and prove bridge + OTA promotion/rollback
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          script: |
+            # Each line is a separate `sh -c`, so a variable set on one line
+            # is gone on the next, and a trailing backslash does not continue.
+            adb install -r ${{ runner.temp }}/vidra-smoke/dist/*-android.apk
+            adb reverse tcp:8099 tcp:8099
+            node "$GITHUB_WORKSPACE/tests/smoke/ota-e2e.mjs" --android-app-id com.vidra.smoke --project '${{ runner.temp }}/vidra-smoke' --cli "$GITHUB_WORKSPACE/src/cli/vidra-cli/dist/cli.js" --work '${{ runner.temp }}/android-ota-work' --port 8099
+
+      - name: Upload Android artifacts and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-smoke-artifacts
+          path: |
+            ${{ runner.temp }}/vidra-smoke/dist/*.apk
+            ${{ runner.temp }}/vidra-smoke/dist/*.aab
+          if-no-files-found: error
