@@ -1,8 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('osx'))">net10.0-maccatalyst</TargetFrameworks>
-    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">net10.0-windows10.0.19041.0</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('osx'))">net10.0-maccatalyst;net10.0-android</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">net10.0-windows10.0.19041.0;net10.0-android</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('linux'))">net10.0-android</TargetFrameworks>
+    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">21.0</SupportedOSPlatformVersion>
     <UseMaui>true</UseMaui>
     <RootNamespace>Vidra.Hosting</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -12,17 +14,20 @@
     <VidraContractScope>Core</VidraContractScope>
 
     <PackageId>Vidra.Hosting.Maui</PackageId>
-    <Version>0.3.1</Version>
     <Description>MAUI host infrastructure for Vidra — WebView bridge, DI extensions, and base page.</Description>
   </PropertyGroup>
 
   <ItemGroup>
     <CompilerVisibleProperty Include="VidraContractScope" />
     <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
+    <PackageReference Include="Xamarin.AndroidX.WebKit"
+                      Version="1.14.0.1"
+                      Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\bridge\Vidra.Bridge\Vidra.Bridge.csproj" />
+    <ProjectReference Include="..\..\updates\Vidra.Updates\Vidra.Updates.csproj" />
     <ProjectReference Include="..\..\tools\Vidra.CodeGen.Generator\Vidra.CodeGen.Generator.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
