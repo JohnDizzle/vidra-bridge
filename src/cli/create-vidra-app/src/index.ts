@@ -10,11 +10,11 @@ import {
   toTitleCase,
   toTextPath,
   parseArgs,
-} from "./utils.js";
-import { exec, tryExecAsync } from "./exec.js";
+} from "@vidra-dev/cli-shared/utils";
+import { exec, tryExecAsync } from "@vidra-dev/cli-shared/exec";
 import { scaffoldDir, type Replacements } from "./scaffold.js";
-import { ensureMauiWorkload } from "./doctor.js";
-import { dim, footer, kv, lime, row, value, wordmark } from "./theme.js";
+import { ensureMauiWorkload } from "@vidra-dev/cli-shared/dotnet-toolchain";
+import { dim, footer, kv, lime, row, value, wordmark } from "@vidra-dev/cli-shared/theme";
 
 /** A dim "label   body" note line (body may contain its own colors). */
 const note = (label: string, body: string): string =>
@@ -25,10 +25,17 @@ const CLI_ROOT = path.resolve(__dirname, "..");
 const TEMPLATES_DIR = path.join(CLI_ROOT, "templates");
 const VIDRA_REPO_ROOT = path.resolve(CLI_ROOT, "..", "..", "..");
 const LOCAL_FEED_DIR = path.join(VIDRA_REPO_ROOT, "dist", "packages");
-const LOCAL_CLI_DIR = CLI_ROOT;
+const LOCAL_CLI_DIR = path.join(VIDRA_REPO_ROOT, "src", "cli", "vidra-cli");
 const LOCAL_SDK_DIR = path.join(VIDRA_REPO_ROOT, "src", "sdk", "vidra-js");
-const VIDRA_VERSION = "0.3.1";
-const SDK_VERSION = "0.2.0";
+/**
+ * The one version Vidra publishes under — CLI, SDK and every NuGet package
+ * share it (see version.json). Read from our own package.json rather than
+ * duplicated as a literal, because a literal is a copy that drifts.
+ */
+const VIDRA_VERSION: string = JSON.parse(
+  fs.readFileSync(path.join(CLI_ROOT, "package.json"), "utf-8"),
+).version;
+const SDK_VERSION = VIDRA_VERSION;
 
 const main = async (): Promise<void> => {
   console.log();
@@ -151,14 +158,14 @@ const main = async (): Promise<void> => {
   );
 
   console.log(row({ glyph: "active", detail: dim("installing dependencies\u2026") }));
-  // The root install provides the `vidra` CLI binary (via the create-vidra-app
+  // The root install provides the `vidra` CLI binary (via the vidra-cli
   // devDependency) that the `dev`/`build` scripts call; the ui install provides
   // React/Vite/@vidra-dev/sdk. They are separate package roots, not workspaces,
   // so the two installs are independent and run concurrently.
   const uiDir = path.join(root, "ui");
   const [rootNpmOk, uiNpmOk] = await Promise.all([
-    tryExecAsync("npm install", root),
-    tryExecAsync("npm install", uiDir),
+    tryExecAsync("npm", ["install"], root),
+    tryExecAsync("npm", ["install"], uiDir),
   ]);
   const npmOk = rootNpmOk && uiNpmOk;
 
@@ -184,7 +191,7 @@ const main = async (): Promise<void> => {
 
   if (isMonorepo) {
     console.log(note("npm", `${dim("@vidra-dev/sdk \u2192")} ${value(LOCAL_SDK_DIR)}`));
-    console.log(note("npm", `${dim("create-vidra-app \u2192")} ${value(LOCAL_CLI_DIR)}`));
+    console.log(note("npm", `${dim("vidra-cli \u2192")} ${value(LOCAL_CLI_DIR)}`));
   }
   console.log();
 
