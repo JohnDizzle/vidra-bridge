@@ -61,7 +61,7 @@ cleanup() {
     kill -KILL "-$DEV_PID" 2>/dev/null || kill -KILL "$DEV_PID" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT
+trap clean EXIT
 
 dump_log() { sed -e 's/^/    /' "$LOG"; }
 
