@@ -1,226 +1,208 @@
-#!/usr/bin/env bash
-# Exercise `vidra dev` end to end: Vite starts, the host builds under
-# `dotnet watch`, the app actually launches, and a C# edit puts a fresh build of
-# it back on screen.
+# Exercise `vidra dev` end to end on Windows: Vite starts, the host builds under
+# `dotnet watch`, the app actually launches, its bridge answers, a C# edit
+# reaches the running app, and a bridge policy edit relaunches it.
 #
-# Usage: dev-loop-smoke.sh <path/to/scaffolded/app> <path/to/cli.js> <macos|windows>
+# Usage: dev-loop-smoke.ps1 -AppDir <path\to\scaffolded\app> -Cli <path\to\cli.js>
+#                           [-ReadyTimeout 300] [-ReloadTimeout 180] [-Screenshot <png>]
 #
-# The C# dev loop is the headline feature of the 0.3 line and had no automated
-# coverage at all — unit tests cover argument construction and log
-# classification, but nothing ever started a real session.
+# The PowerShell counterpart of dev-loop-smoke.sh, which tears its session down
+# through POSIX process groups that git-bash on the Windows runner does not
+# provide. Here the session runs under one cmd.exe whose tree `taskkill /T`
+# takes down: Vite, dotnet watch and the app it launched.
 #
-# Everything here is a hard assertion. It did not used to be: on Mac Catalyst
-# `dotnet watch run` never launched the app — the run target execs
-# $(AssemblyName).app while the bundle is built as $(_AppBundleName).app, a
-# name that never matches for a scaffolded app — so the session parked forever
-# and the two most valuable checks — the app reaching readiness, and reacting
-# to an edit — could only be reported as warnings. That was a stale Catalyst
-# SDK pack (dotnet/macios#26318, fixed in 26.2.10233+), not a platform limit,
-# so the checks gate again.
-#
-# What is deliberately NOT asserted is *how* the edit lands. The edit injects a
-# line the running app prints, so the assertion is that the app prints it —
-# which is true whether `dotnet watch` applied a delta to the live process or
-# `vidra dev` rebuilt and relaunched after the hot-reload agent dropped out
-# (dotnet/sdk#55488, which on Catalyst hits about half of sessions). Both are
-# correct outcomes; requiring one would make this test lie on the other. Which
-# one happened is reported, not gated.
-#
-# Everything is time-bounded and the session is always torn down, because a
-# hanging dev server is exactly the failure this must not cause.
-set -uo pipefail
+# As in the bash script, what is asserted is that the edit reaches the app, not
+# how: a hot-reload delta and a rebuild + relaunch are both correct outcomes.
+param(
+    [Parameter(Mandatory = $true)][string]$AppDir,
+    [Parameter(Mandatory = $true)][string]$Cli,
+    [int]$ReadyTimeout = 300,
+    [int]$ReloadTimeout = 180,
+    [string]$Screenshot = ""
+)
 
-APP_DIR="${1:?usage: dev-loop-smoke.sh <app-dir> <cli.js> <target>}"
-CLI="${2:?missing cli.js path}"
-TARGET="${3:?missing target}"
+$ErrorActionPreference = "Stop"
 
-READY_TIMEOUT="${VIDRA_DEV_READY_TIMEOUT:-300}"
-RELOAD_TIMEOUT="${VIDRA_DEV_RELOAD_TIMEOUT:-180}"
+# Native file notifications routinely fail to fire for a CI working directory;
+# polling is slower but deterministic.
+if (-not $env:DOTNET_USE_POLLING_FILE_WATCHER) { $env:DOTNET_USE_POLLING_FILE_WATCHER = "1" }
 
-# dotnet watch's default file watcher relies on native filesystem notifications,
-# which routinely fail to fire for a working directory on a CI runner — the
-# session sits in "Waiting for a file to change" and never notices an edit.
-# Polling is slower but deterministic, which is the right trade for a test.
-export DOTNET_USE_POLLING_FILE_WATCHER="${DOTNET_USE_POLLING_FILE_WATCHER:-1}"
+$ReadyLine = "host ready"
+$EditMarker = "[smoke] edit applied"
+$CounterLine = "[MainPage] Counter is now"
 
-# The CLI prints this once per launch, and only after the host process itself
-# printed the `[vidra] host ready` sentinel from VidraPage — so it means the app
-# got as far as loading its page, not merely that a process was spawned.
-READY_LINE='host ready'
+$log = Join-Path $env:RUNNER_TEMP "vidra-dev-$(Get-Random).log"
+if ($env:VIDRA_DEV_LOG) { $log = $env:VIDRA_DEV_LOG }
+Set-Location $AppDir
 
-LOG="$(mktemp)"
-cd "$APP_DIR"
-
-cleanup() {
-  if [ -n "${DEV_PID:-}" ] && kill -0 "$DEV_PID" 2>/dev/null; then
-    # `vidra dev` supervises Vite, a dotnet watch process group and the app it
-    # launched, so signal the group and give it a moment to take its children
-    # with it.
-    kill -TERM "-$DEV_PID" 2>/dev/null || kill -TERM "$DEV_PID" 2>/dev/null || true
-    sleep 3
-    kill -KILL "-$DEV_PID" 2>/dev/null || kill -KILL "$DEV_PID" 2>/dev/null || true
-  fi
-}
-trap clean EXIT
-
-dump_log() { sed -e 's/^/    /' "$LOG"; }
-
-# Number of times the session has reported a ready host so far. The raw
-# `[vidra] host ready` sentinel is filtered out of the passthrough output, but
-# excluding it explicitly keeps the count meaning "the CLI said so" even if a
-# chunk boundary ever lets one through.
-ready_count() { grep "$READY_LINE" "$LOG" | grep -cv '\[vidra\]'; }
-
-# Waits until at least $1 ready reports have been seen, or $2 seconds elapse.
-# Fails the run if `vidra dev` dies while we wait.
-wait_for_ready() {
-  local want="$1" limit="$2" waited=0
-  while [ "$waited" -lt "$limit" ]; do
-    [ "$(ready_count)" -ge "$want" ] && return 0
-    if ! kill -0 "$DEV_PID" 2>/dev/null; then
-      echo "::error::vidra dev exited before the host reached readiness"
-      dump_log
-      exit 1
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
-  return 1
+# Reads the log while cmd.exe still holds it open for writing.
+function Read-LogText {
+    if (-not (Test-Path $log)) { return "" }
+    $fs = [System.IO.File]::Open($log, 'Open', 'Read', 'ReadWrite, Delete')
+    try {
+        $reader = New-Object System.IO.StreamReader($fs)
+        return $reader.ReadToEnd()
+    } finally { $fs.Dispose() }
 }
 
-echo "==> starting: vidra dev --target $TARGET"
-# `setsid` is util-linux and does not exist on macOS. Enabling job control makes
-# bash place the background job in its own process group with the child as
-# leader, which gives us the same `kill -- -PID` teardown portably.
-set -m
-node "$CLI" dev --target "$TARGET" >"$LOG" 2>&1 &
-DEV_PID=$!
-set +m
+function Read-Log { (Read-LogText) -split "`r?`n" }
 
-if ! wait_for_ready 1 "$READY_TIMEOUT"; then
-  echo "::error::the host never reached readiness within ${READY_TIMEOUT}s"
-  dump_log
-  exit 1
-fi
-echo "==> host ready"
+# Where output written from now on starts: the number of lines the log has
+# finished. Not @(Read-Log).Count, which also counts the empty element after the
+# last newline, and so skips the first line written after it.
+function Log-Mark { [regex]::Matches((Read-LogText), "`n").Count }
 
-grep -q "vite ready" "$LOG" \
-  || { echo "::error::Vite never reported ready"; dump_log; exit 1; }
-echo "==> vite ready"
-
-# Inject a line into a method the app runs every few seconds, then require the
-# running app to print it. A comment-only edit would prove nothing here: under
-# the delta loop it produces no runtime effect at all, so the session would look
-# identical whether the edit had been applied or silently swallowed.
-MAIN_PAGE="$(find src -name 'MainPage.cs' -print -quit)"
-if [ -z "$MAIN_PAGE" ]; then
-  echo "::error::could not find MainPage.cs to edit"
-  exit 1
-fi
-
-EDIT_MARKER="[smoke] edit applied"
-
-echo "==> editing $MAIN_PAGE"
-# `wc -l` pads its output with spaces on macOS, and `tail -n +"  42"` fails
-# with "illegal offset" — which would silently blank the diagnostic exactly
-# when it is needed.
-before="$(wc -l < "$LOG" | tr -d '[:space:]')"
-ready_before="$(grep -c "$READY_LINE" "$LOG" | tr -d '[:space:]')"
-perl -0pi -e 's/(private async Task OnTickAsync\([^)]*\)\s*\n?\s*\{)/$1\n        System.Console.WriteLine("[smoke] edit applied");/' "$MAIN_PAGE"
-grep -qF "$EDIT_MARKER" "$MAIN_PAGE" || {
-  echo "::error::the edit did not apply to $MAIN_PAGE — has OnTickAsync been renamed?"
-  exit 1
+# Literal substring match: -like would read "[MainPage]" as a character class.
+function Find-Lines([string]$Needle, [int]$From = 0) {
+    @(Read-Log | Select-Object -Skip $From | Where-Object { $_.Contains($Needle) })
 }
-touch "$MAIN_PAGE"
 
-waited=0
-while [ "$waited" -lt "$RELOAD_TIMEOUT" ]; do
-  if tail -n +"$before" "$LOG" | grep -qF "$EDIT_MARKER"; then break; fi
-  if ! kill -0 "$DEV_PID" 2>/dev/null; then
-    echo "::error::vidra dev exited while waiting for the edit to take effect"
-    dump_log
+function Dump-Log([int]$From = 0) {
+    Read-Log | Select-Object -Skip $From | ForEach-Object { "    $_" }
+}
+
+# Ready reports from the CLI, not the raw `[vidra] host ready` sentinel.
+function Ready-Count {
+    @(Find-Lines $ReadyLine | Where-Object { -not $_.Contains("[vidra]") }).Count
+}
+
+# The index of the latest ready report. Output after it comes from the newest
+# host only: the CLI waits for the old one to exit before it starts another.
+function Last-ReadyIndex {
+    $lines = @(Read-Log)
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i].Contains($ReadyLine) -and -not $lines[$i].Contains("[vidra]")) { return $i }
+    }
+    return 0
+}
+
+function Save-Screenshot([string]$Path) {
+    if (-not $Path) { return }
+    try {
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+        $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+        $g.Dispose(); $bmp.Dispose()
+        Write-Host "==> screenshot: $Path"
+    } catch {
+        Write-Host "::warning::screenshot failed: $_"
+    }
+}
+
+function Stop-Session {
+    if ($script:session -and -not $script:session.HasExited) {
+        & taskkill /PID $script:session.Id /T /F 2>&1 | Out-Null
+    }
+}
+
+function Fail([string]$Message, [int]$From = 0) {
+    Write-Host "::error::$Message"
+    Dump-Log $From
+    Stop-Session
     exit 1
-  fi
-  sleep 3
-  waited=$((waited + 3))
-done
+}
 
-if ! tail -n +"$before" "$LOG" | grep -qF "$EDIT_MARKER"; then
-  echo "::error::the edit never reached the running app within ${RELOAD_TIMEOUT}s"
-  echo "---- output produced after the edit ----"
-  tail -n +"$before" "$LOG" | sed -e 's/^/    /'
-  exit 1
-fi
+function Wait-Ready([int]$Want, [int]$Limit) {
+    for ($waited = 0; $waited -lt $Limit; $waited += 2) {
+        if ((Ready-Count) -ge $Want) { return $true }
+        if ($script:session.HasExited) { Fail "vidra dev exited before the host reached readiness" }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
 
-echo "---- session output ----"
-dump_log | tail -40
+Write-Host "==> starting: vidra dev --target windows (log: $log)"
+$cmdLine = "/d /s /c `"`"node`" `"$Cli`" dev --target windows > `"$log`" 2>&1`""
+$script:session = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdLine -PassThru -NoNewWindow
 
-ready_after="$(grep -c "$READY_LINE" "$LOG" | tr -d '[:space:]')"
-if [ "$ready_after" -gt "$ready_before" ]; then
-  echo "==> the edit reached the app after a rebuild + relaunch (~${waited}s)"
-else
-  echo "==> the edit reached the running app in place, no relaunch (~${waited}s)"
-fi
+try {
+    if (-not (Wait-Ready 1 $ReadyTimeout)) { Fail "the host never reached readiness within ${ReadyTimeout}s" }
+    Write-Host "==> host ready"
 
-# A bridge policy is a native bundle resource rather than managed code.
-# `dotnet watch` otherwise reports "No managed code changes to apply" and leaves
-# the old policy running while Vite loads the new fingerprint. The CLI must
-# deliberately replace its watch session and bring up a host with the new
-# policy.
-CONFIG="$APP_DIR/vidra.config.ts"
-policy_ready_before="$(ready_count)"
-echo "==> editing $CONFIG"
-perl -0pi -e 's/^\s*builtInNative\.appWindow\.center,\n//m' "$CONFIG"
-if grep -qF "builtInNative.appWindow.center," "$CONFIG"; then
-  echo "::error::the bridge policy edit did not apply"
-  exit 1
-fi
+    if ((Find-Lines "vite ready").Count -eq 0) { Fail "Vite never reported ready" }
+    Write-Host "==> vite ready"
 
-waited=0
-while [ "$waited" -lt "$RELOAD_TIMEOUT" ]; do
-  [ "$(ready_count)" -gt "$policy_ready_before" ] && break
-  if ! kill -0 "$DEV_PID" 2>/dev/null; then
-    echo "::error::vidra dev exited while applying the bridge policy"
-    dump_log
-    exit 1
-  fi
-  sleep 3
-  waited=$((waited + 3))
-done
+    # The template page increments the JS counter every 10s, so a counter line
+    # means a C# -> JS -> C# round-trip over the dev bridge.
+    for ($waited = 0; $waited -lt 60; $waited += 2) {
+        if ((Find-Lines $CounterLine).Count -gt 0) { break }
+        if ((Find-Lines "Counter increment failed").Count -gt 0) { Fail "the bridge call from C# into JS failed" }
+        Start-Sleep -Seconds 2
+    }
+    if ((Find-Lines $CounterLine).Count -eq 0) { Fail "no counter round-trip within 60s of readiness" }
+    Write-Host "==> bridge round-trip in the dev session"
+    Save-Screenshot $Screenshot
 
-if [ "$(ready_count)" -le "$policy_ready_before" ]; then
-  echo "::error::the host was not relaunched after the bridge policy changed"
-  dump_log
-  exit 1
-fi
-grep -q "vidra.config.ts updated — rebuilding and relaunching the host" "$LOG" \
-  || { echo "::error::the CLI did not report the bridge policy relaunch"; dump_log; exit 1; }
-echo "==> bridge policy rebuilt into a relaunched host (~${waited}s)"
+    $mainPage = Get-ChildItem -Path src -Recurse -Filter MainPage.cs | Select-Object -First 1
+    if (-not $mainPage) { Fail "could not find MainPage.cs to edit" }
 
-# Ctrl-C must not return while the detached dotnet-watch process group is still
-# alive. Capture its leader before shutdown so this checks the exact process
-# the CLI owned rather than relying on a broad process-name search.
-WATCH_PID="$(pgrep -P "$DEV_PID" -f 'dotnet watch' | head -1 || true)"
-[ -n "$WATCH_PID" ] \
-  || { echo "::error::could not identify the supervised dotnet watch process"; dump_log; exit 1; }
+    $before = Log-Mark
+    $readyBefore = Ready-Count
+    Write-Host "==> editing $($mainPage.FullName)"
+    $src = [System.IO.File]::ReadAllText($mainPage.FullName)
+    $edited = [regex]::Replace($src, '(private async Task OnTickAsync\([^)]*\)\s*\{)',
+        "`$1`n        System.Console.WriteLine(`"$EditMarker`");")
+    if ($edited -eq $src) { Fail "the edit did not apply to $($mainPage.Name) - has OnTickAsync been renamed?" }
+    [System.IO.File]::WriteAllText($mainPage.FullName, $edited)
 
-echo "==> stopping vidra dev with SIGINT"
-kill -INT "$DEV_PID"
-waited=0
-while kill -0 "$DEV_PID" 2>/dev/null && [ "$waited" -lt 15 ]; do
-  sleep 1
-  waited=$((waited + 1))
-done
-if kill -0 "$DEV_PID" 2>/dev/null; then
-  echo "::error::vidra dev did not exit after SIGINT"
-  exit 1
-fi
-if kill -0 "$WATCH_PID" 2>/dev/null; then
-  echo "::error::dotnet watch was orphaned after vidra dev exited"
-  ps -p "$WATCH_PID" -o pid=,ppid=,stat=,command=
-  exit 1
-fi
-DEV_PID=""
-echo "==> Ctrl-C reaped dotnet watch (~${waited}s)"
+    $landed = $false
+    for ($waited = 0; $waited -lt $ReloadTimeout; $waited += 3) {
+        if ((Find-Lines $EditMarker $before).Count -gt 0) { $landed = $true; break }
+        if ($script:session.HasExited) { Fail "vidra dev exited while waiting for the edit to take effect" $before }
+        Start-Sleep -Seconds 3
+    }
+    if (-not $landed) { Fail "the edit never reached the running app within ${ReloadTimeout}s" $before }
 
-echo "==> PASS — dev session starts, reloads code and policy, and shuts down cleanly"
+    if ((Ready-Count) -gt $readyBefore) {
+        Write-Host "==> the edit reached the app after a rebuild + relaunch (~${waited}s)"
+    } else {
+        Write-Host "==> the edit reached the running app in place, no relaunch (~${waited}s)"
+    }
+
+    # A bridge policy is a native bundle resource, not managed code, so
+    # `dotnet watch` cannot apply it as a delta. As in dev-loop-smoke.sh, the CLI
+    # must replace its watch session and bring up a host with the new policy;
+    # here that host must also answer the bridge again, which is what a host
+    # whose page never loads cannot do.
+    $config = Join-Path $AppDir "vidra.config.ts"
+    $policyFrom = Log-Mark
+    $readyBefore = Ready-Count
+    Write-Host "==> editing $config"
+    $text = [System.IO.File]::ReadAllText($config)
+    $edited = [regex]::Replace($text, '(?m)^[ \t]*builtInNative\.appWindow\.center,\r?\n', '')
+    if ($edited -eq $text) { Fail "the bridge policy edit did not apply to $config" }
+    [System.IO.File]::WriteAllText($config, $edited)
+
+    $relaunched = $false
+    for ($waited = 0; $waited -lt $ReloadTimeout; $waited += 3) {
+        if ((Ready-Count) -gt $readyBefore) { $relaunched = $true; break }
+        if ($script:session.HasExited) { Fail "vidra dev exited while applying the bridge policy" $policyFrom }
+        Start-Sleep -Seconds 3
+    }
+    if (-not $relaunched) { Fail "the host was not relaunched after the bridge policy changed" $policyFrom }
+    if ((Find-Lines "rebuilding and relaunching the host" $policyFrom).Count -eq 0) {
+        Fail "the CLI did not report the bridge policy relaunch" $policyFrom
+    }
+    Write-Host "==> bridge policy rebuilt into a relaunched host (~${waited}s)"
+
+    # Only output after the new host's ready report counts: before it, the old
+    # host can still print a last tick, or a call cut short as it is stopped.
+    $newHostFrom = (Last-ReadyIndex) + 1
+    for ($waited = 0; $waited -lt 60; $waited += 2) {
+        if ((Find-Lines $CounterLine $newHostFrom).Count -gt 0) { break }
+        if ($script:session.HasExited) { break }
+        Start-Sleep -Seconds 2
+    }
+    if ((Find-Lines $CounterLine $newHostFrom).Count -eq 0) { Fail "no counter round-trip from the relaunched host within 60s" $policyFrom }
+    Write-Host "==> bridge round-trip in the relaunched host"
+
+    Write-Host "---- session output ----"
+    Dump-Log | Select-Object -Last 60
+
+    Write-Host "==> PASS - dev session starts, serves, launches the app, the bridge answers, a C# edit reaches it, and a bridge policy edit relaunches it"
+} finally {
+    Stop-Session
+}
+exit 0
