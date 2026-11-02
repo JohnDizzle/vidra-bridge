@@ -1,5 +1,6 @@
 {
   "name": "{{projectNameKebab}}",
+  "version": "0.1.0",
   "private": true,
   "scripts": {
     "build": "vidra build",
@@ -7,9 +8,11 @@
     "dev:ui": "npm run dev --prefix ui",
     "dev:host:macos": "vidra run --target macos",
     "dev:host:windows": "vidra run --target windows",
+    "dev:host:android": "vidra run --target android",
     "doctor": "vidra doctor"
   },
   "devDependencies": {
-    "create-vidra-app": "{{cliVersion}}"
+    "@vidra-dev/sdk": "{{sdkVersion}}",
+    "vidra-cli": "{{cliVersion}}"
   }
 }
